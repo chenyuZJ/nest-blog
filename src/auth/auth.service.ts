@@ -1,0 +1,134 @@
+import { UserService } from './../user/user.service';
+import { Injectable, BadRequestException, HttpException } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { JwtService } from '@nestjs/jwt';
+import { User } from '../user/entities/user.entity';
+import {
+  AccessTokenInfo,
+  AccessConfig,
+  WechatError,
+  WechatUserInfo,
+} from './auth.interface';
+import { lastValueFrom, map, Observable } from 'rxjs';
+import { AxiosResponse } from 'axios';
+import { LoginDto } from './dto/login.dto';
+@Injectable()
+export class AuthService {
+  constructor(
+    private jwtService: JwtService, // 生成token方法
+    private userService: UserService, // user方法
+    private httpService: HttpService, // http方法
+  ) {}
+  private accessTokenInfo: AccessTokenInfo;
+  public apiServer = 'https://api.weixin.qq.com';
+
+  // createToken(user: Partial<User>) {
+  //   return this.jwtService.sign(user);
+  // }
+
+  async createToken(user: Partial<User>) {
+    // 生成token
+    const token = this.jwtService.sign({
+      id: user.id,
+      username: user.username,
+      role: user.role || 'root',
+    });
+
+    return token;
+  }
+
+  async login(user: LoginDto) {
+    const { username } = user;
+    const userInfo = await this.userService.findUser(username);
+    return userInfo;
+  }
+
+  async register(user: LoginDto) {
+    const { username } = user;
+    const token = await this.createToken(user);
+    const userInfo = await this.userService.findUser(username);
+    if (!userInfo) {
+      // 获取用户信息，注册新用户
+      user.token = token;
+      return await this.userService.register(user);
+    }
+    return userInfo;
+  }
+
+  async getUser(user) {
+    return await this.userService.findUser(user.username);
+  }
+
+  async loginWithWechat(code) {
+    // 扫描生成code
+    if (!code) {
+      throw new BadRequestException('请输入微信授权码');
+    }
+    await this.getAccessToken(code); // 生成accessToken
+
+    const user = await this.getUserByOpenid();
+    if (!user) {
+      // 获取用户信息，注册新用户
+      const userInfo: WechatUserInfo = await this.getUserInfo();
+      return this.userService.registerByWechat(userInfo);
+    }
+    return this.createToken(user);
+  }
+
+  async getUserByOpenid() {
+    return await this.userService.findByOpenid(this.accessTokenInfo.openid);
+  }
+  async getUserInfo() {
+    const result: AxiosResponse<WechatError & WechatUserInfo> =
+      await lastValueFrom(
+        this.httpService.get(
+          `${this.apiServer}/sns/userinfo?access_token=${this.accessTokenInfo.accessToken}&openid=${this.accessTokenInfo.openid}`,
+        ),
+      );
+    if (result.data.errcode) {
+      throw new BadRequestException(
+        `[getUserInfo] errcode:${result.data.errcode}, errmsg:${result.data.errmsg}`,
+      );
+    }
+    console.log('result', result.data);
+
+    return result.data;
+  }
+
+  async getAccessToken(code) {
+    const { APPID, APPSECRET } = process.env;
+    if (!APPSECRET) {
+      throw new BadRequestException('[getAccessToken]必须有appSecret');
+    }
+    if (
+      !this.accessTokenInfo ||
+      (this.accessTokenInfo && this.isExpires(this.accessTokenInfo))
+    ) {
+      // 请求accessToken数据
+      const res: AxiosResponse<WechatError & AccessConfig, any> =
+        await lastValueFrom(
+          this.httpService.get(
+            `${this.apiServer}/sns/oauth2/access_token?appid=${APPID}&secret=${APPSECRET}&code=${code}&grant_type=authorization_code`,
+          ),
+        );
+
+      if (res.data.errcode) {
+        throw new BadRequestException(
+          `[getAccessToken] errcode:${res.data.errcode}, errmsg:${res.data.errmsg}`,
+        );
+      }
+      this.accessTokenInfo = {
+        accessToken: res.data.access_token,
+        expiresIn: res.data.expires_in,
+        getTime: Date.now(),
+        openid: res.data.openid,
+      };
+    }
+
+    return this.accessTokenInfo.accessToken;
+  }
+
+  isExpires(access) {
+    return Date.now() - access.getTime > access.expiresIn * 1000;
+  }
+}
